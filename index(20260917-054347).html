@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ربات‌ساز روبیکا</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#f5f7fb;color:#172033}
+.wrap{max-width:900px;margin:40px auto;padding:20px}.card{background:white;border-radius:22px;padding:28px;box-shadow:0 10px 35px #00000010;margin-bottom:18px}
+h1{margin-top:0}.muted{color:#697386}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+label{display:block;font-weight:bold;margin-bottom:7px}input,textarea{width:100%;padding:13px;border:1px solid #d9deea;border-radius:12px;font:inherit}textarea{min-height:130px;resize:vertical}
+button{border:0;border-radius:12px;padding:13px 20px;font:inherit;font-weight:bold;cursor:pointer;background:#315efb;color:#fff;margin-top:12px}
+button.secondary{background:#eef2ff;color:#315efb}.status{padding:12px;border-radius:12px;margin-top:15px;background:#f0fdf4}.error{background:#fff1f2;color:#be123c}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>🤖 ربات‌ساز روبیکا</h1>
+    <p class="muted">نسخه اول: اتصال ربات، پیام شروع و پاسخ خودکار.</p>
+    <label>آدرس بک‌اند</label>
+    <input id="api" value="http://localhost:8000">
+    <label style="margin-top:14px">توکن ربات</label>
+    <input id="token" type="password" placeholder="توکن ربات را وارد کنید">
+    <button onclick="connect()">🔗 اتصال ربات</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <h2>⚙️ تنظیمات ربات</h2>
+    <div class="grid">
+      <div>
+        <label>پیام /start</label>
+        <textarea id="welcome">سلام! به ربات خوش آمدی. 👋</textarea>
+      </div>
+      <div>
+        <label>پاسخ پیش‌فرض</label>
+        <textarea id="fallback">پیامت دریافت شد. 🤖</textarea>
+      </div>
+    </div>
+    <button onclick="save()">💾 ذخیره تنظیمات</button>
+    <button class="secondary" onclick="disconnect()">⛔ قطع اتصال</button>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+function setStatus(t,err=false){$('status').className='status '+(err?'error':'');$('status').textContent=t}
+async function api(path, options={}){
+  const base=$('api').value.replace(/\/$/,'');
+  const r=await fetch(base+path,{headers:{'Content-Type':'application/json'},...options});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.detail||'خطا');
+  return d;
+}
+async function connect(){
+  try{
+    const d=await api('/connect',{method:'POST',body:JSON.stringify({token:$('token').value})});
+    setStatus('🟢 ربات متصل شد: '+JSON.stringify(d.bot||{}));
+  }catch(e){setStatus('🔴 '+e.message,true)}
+}
+async function save(){
+  try{
+    await api('/config',{method:'POST',body:JSON.stringify({
+      token:$('token').value,welcome:$('welcome').value,fallback:$('fallback').value
+    })});
+    setStatus('🟢 تنظیمات ذخیره شد.');
+  }catch(e){setStatus('🔴 '+e.message,true)}
+}
+async function disconnect(){
+  try{await api('/disconnect',{method:'POST',body:JSON.stringify({token:$('token').value})});setStatus('🟡 اتصال قطع شد.')}
+  catch(e){setStatus('🔴 '+e.message,true)}
+}
+</script>
+</body>
+</html>
