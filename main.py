@@ -1,130 +1,258 @@
-import os
 import asyncio
-from typing import Dict, Any
+import logging
+from typing import Any, Dict, Optional
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Rubika Bot Builder API", version="1.0.0")
+API_BASE = "https://botapi.rubika.ir/v1"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("rubika-bot-builder")
+
+app = FastAPI(title="Rubika Bot Builder")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=False,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Demo storage. For production, replace with a database/secret store.
+# Prototype storage: data is kept in memory and is lost when Render restarts the service.
 bots: Dict[str, Dict[str, Any]] = {}
 tasks: Dict[str, asyncio.Task] = {}
 
-API_BASE = "https://botapi.rubika.ir/v1"
 
 class ConnectRequest(BaseModel):
     token: str
 
+
 class ConfigRequest(BaseModel):
     token: str
-    welcome: str = "سلام! به ربات خوش آمدی."
-    fallback: str = "پیامت دریافت شد."
+    welcome: str = "سلام! 👋\nبه ربات ما خوش آمدی."
+    fallback: str = "پیامت دریافت شد. 🤖"
 
-async def rubika(method: str, token: str, data: dict | None = None):
-    # Rubika Bot API uses token in the URL path for the documented API.
+
+async def rubika(method: str, token: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = f"{API_BASE}/{token}/{method}"
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=data or {})
-        if r.status_code >= 400:
-            raise HTTPException(502, f"Rubika API error: {r.text[:500]}")
-        return r.json()
+    timeout = httpx.Timeout(connect=15.0, read=35.0, write=15.0, pool=15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=data or {})
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise RuntimeError("پاسخ API روبیکا معتبر نیست.")
+        return result
+
+
+def get_result(data: Dict[str, Any]) -> Dict[str, Any]:
+    result = data.get("result")
+    return result if isinstance(result, dict) else data
+
+
+def extract_bot_info(data: Dict[str, Any]) -> Dict[str, Any]:
+    result = get_result(data)
+    bot = result.get("bot")
+    if isinstance(bot, dict):
+        return bot
+    nested = result.get("data")
+    if isinstance(nested, dict) and isinstance(nested.get("bot"), dict):
+        return nested["bot"]
+    return {}
+
+
+def extract_updates(data: Dict[str, Any]) -> list:
+    result = get_result(data)
+    candidates = [result.get("updates"), data.get("updates")]
+    for container in (result.get("data"), data.get("data")):
+        if isinstance(container, dict):
+            candidates.append(container.get("updates"))
+    for value in candidates:
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def extract_next_offset(data: Dict[str, Any]) -> Optional[str]:
+    result = get_result(data)
+    candidates = [result.get("next_offset_id"), data.get("next_offset_id")]
+    for container in (result.get("data"), data.get("data")):
+        if isinstance(container, dict):
+            candidates.append(container.get("next_offset_id"))
+    for value in candidates:
+        if value is not None and str(value) != "":
+            return str(value)
+    return None
+
+
+def find_value(obj: Any, keys: tuple[str, ...]) -> Any:
+    if isinstance(obj, dict):
+        for key in keys:
+            if key in obj and obj[key] is not None:
+                return obj[key]
+        for value in obj.values():
+            found = find_value(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_value(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_message(update: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(update, dict):
+        return None, None
+
+    update_type = update.get("type")
+    if update_type and str(update_type).lower() not in {"new_message", "newmessage", "message"}:
+        return None, None
+
+    chat_id = update.get("chat_id") or update.get("chatId") or update.get("object_guid")
+    message = update.get("new_message") or update.get("newMessage") or update.get("message")
+    if not isinstance(message, dict):
+        message = {}
+
+    text = message.get("text") or message.get("message") or message.get("body")
+    if text is None:
+        text = find_value(update, ("text", "raw_text"))
+    if chat_id is None:
+        chat_id = find_value(update, ("chat_id", "chatId", "object_guid", "chat_guid"))
+
+    return (str(chat_id) if chat_id is not None else None,
+            str(text).strip() if text is not None else None)
+
+
+async def send_text(token: str, chat_id: str, text: str) -> None:
+    result = await rubika("sendMessage", token, {"chat_id": chat_id, "text": text})
+    logger.info("sendMessage -> chat_id=%s response=%s", chat_id, result)
+
+
+async def poll_bot(token: str) -> None:
+    logger.info("Polling started for bot token ending ...%s", token[-6:])
+    offset_id: Optional[str] = None
+
+    while True:
+        try:
+            if token not in bots:
+                return
+
+            payload: Dict[str, Any] = {"limit": 100}
+            if offset_id:
+                payload["offset_id"] = offset_id
+
+            data = await rubika("getUpdates", token, payload)
+
+            next_offset = extract_next_offset(data)
+            if next_offset:
+                offset_id = next_offset
+
+            updates = extract_updates(data)
+            if updates:
+                logger.info("Received %d update(s)", len(updates))
+
+            for update in updates:
+                try:
+                    chat_id, text = extract_message(update)
+                    logger.info("Parsed update: chat_id=%s text=%r", chat_id, text)
+                    if not chat_id or text is None:
+                        logger.warning("Could not parse update: %s", update)
+                        continue
+
+                    config = bots.get(token)
+                    if config is None:
+                        return
+
+                    reply = config["welcome"] if text == "/start" else config["fallback"]
+                    await send_text(token, chat_id, reply)
+                except Exception:
+                    logger.exception("Error while processing one update")
+
+            await asyncio.sleep(0.5)
+
+        except asyncio.CancelledError:
+            logger.info("Polling cancelled")
+            raise
+        except Exception:
+            logger.exception("Polling error; retrying in 5 seconds")
+            await asyncio.sleep(5)
+
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "rubika-bot-builder"}
+
 
 @app.post("/connect")
-async def connect(req: ConnectRequest):
-    token = req.token.strip()
+async def connect(request: ConnectRequest):
+    token = request.token.strip()
     if not token:
-        raise HTTPException(400, "Token is required")
-    result = await rubika("getMe", token)
-    if not result.get("ok", True):
-        raise HTTPException(400, "توکن معتبر نیست")
-    bot = result.get("data", {}).get("bot", result.get("bot", {}))
+        raise HTTPException(status_code=400, detail="توکن وارد نشده است.")
+
+    try:
+        data = await rubika("getMe", token, {})
+    except httpx.HTTPStatusError as exc:
+        logger.exception("getMe HTTP error")
+        raise HTTPException(status_code=400, detail=f"API روبیکا خطای HTTP {exc.response.status_code} داد.")
+    except Exception as exc:
+        logger.exception("getMe error")
+        raise HTTPException(status_code=400, detail=f"اتصال به API روبیکا ناموفق بود: {exc}")
+
+    bot_info = extract_bot_info(data)
+    old = bots.get(token, {})
     bots[token] = {
-        "welcome": "سلام! به ربات خوش آمدی.",
-        "fallback": "پیامت دریافت شد.",
-        "enabled": True,
-        "name": bot.get("first_name") or bot.get("username") or "Rubika Bot",
+        "token": token,
+        "welcome": old.get("welcome", "سلام! 👋\nبه ربات ما خوش آمدی."),
+        "fallback": old.get("fallback", "پیامت دریافت شد. 🤖"),
+        "bot": bot_info,
     }
-    if token not in tasks or tasks[token].done():
+
+    old_task = tasks.get(token)
+    if old_task is None or old_task.done():
         tasks[token] = asyncio.create_task(poll_bot(token))
-    return {"ok": True, "bot": bot}
+
+    logger.info("Bot connected successfully")
+    return {"ok": True, "message": "ربات با موفقیت متصل شد.", "bot": bot_info}
+
 
 @app.post("/config")
-async def config(req: ConfigRequest):
-    if req.token not in bots:
-        raise HTTPException(404, "ابتدا ربات را متصل کنید")
-    bots[req.token].update({
-        "welcome": req.welcome[:4000],
-        "fallback": req.fallback[:4000],
-    })
-    return {"ok": True, "config": bots[req.token]}
+async def config(request: ConfigRequest):
+    token = request.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="توکن وارد نشده است.")
+    if token not in bots:
+        raise HTTPException(status_code=400, detail="ابتدا ربات را متصل کنید.")
+
+    bots[token]["welcome"] = request.welcome
+    bots[token]["fallback"] = request.fallback
+    logger.info("Bot configuration updated")
+    return {"ok": True, "message": "تنظیمات با موفقیت ذخیره شد."}
+
 
 @app.post("/disconnect")
-async def disconnect(req: ConnectRequest):
-    task = tasks.pop(req.token, None)
-    if task:
+async def disconnect(request: ConnectRequest):
+    token = request.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="توکن وارد نشده است.")
+
+    task = tasks.pop(token, None)
+    if task is not None and not task.done():
         task.cancel()
-    bots.pop(req.token, None)
-    return {"ok": True}
-
-async def send_message(token: str, chat_id: str, text: str):
-    return await rubika("sendMessage", token, {
-        "chat_id": chat_id,
-        "text": text,
-    })
-
-def extract_updates(payload: dict):
-    # Accommodates common response shapes used by Rubika Bot API wrappers.
-    data = payload.get("data", payload)
-    updates = data.get("updates", []) if isinstance(data, dict) else []
-    return updates or []
-
-def extract_message(update: dict):
-    # Flexible parser because update schemas can differ between API versions.
-    msg = update.get("message") or update.get("inline_message") or update
-    if not isinstance(msg, dict):
-        return None
-    text = msg.get("text")
-    chat_id = msg.get("chat_id") or msg.get("object_guid") or msg.get("chat_guid")
-    return text, chat_id
-
-async def poll_bot(token: str):
-    offset = None
-    while token in bots and bots[token].get("enabled"):
         try:
-            data = {}
-            if offset is not None:
-                data["offset_id"] = offset
-            result = await rubika("getUpdates", token, data)
-            for upd in extract_updates(result):
-                offset = upd.get("update_id") or upd.get("id") or offset
-                parsed = extract_message(upd)
-                if not parsed:
-                    continue
-                text, chat_id = parsed
-                if not text or not chat_id:
-                    continue
-                text = text.strip()
-                if text == "/start":
-                    await send_message(token, chat_id, bots[token]["welcome"])
-                else:
-                    await send_message(token, chat_id, bots[token]["fallback"])
+            await task
         except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print("poll error:", e)
-            await asyncio.sleep(5)
-        await asyncio.sleep(1)
+            pass
 
-# NOTE: This sample intentionally uses the documented Bot API shape.
-# If Rubika changes the API response/request schema, adjust extract_message/extract_updates.
+    bots.pop(token, None)
+    logger.info("Bot disconnected")
+    return {"ok": True, "message": "اتصال ربات قطع شد."}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
